@@ -1,234 +1,316 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-const { createClient } = require('@supabase/supabase-js');
-const path = require('path');
-
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
-
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_KEY
-);
-
-const COORD_SENHA = process.env.COORD_SENHA || 'Sport2026';
-
-const PROFESSORES = [
-  'Adriana Lins da Silva','Aline Elioenai Gomes de Souza','Ana Beatriz Vanderlei',
-  'Aristophanes Henrique Claudiano','Bruno Vinícius de Melo Soatmann','Christiani Lira de Araújo',
-  'Cleodon Lopes de Albuquerque Neto','Cryslaine Rafaella Santos Ribeiro da Silva',
-  'Débora Angélica Vieira de Melo','Denilson Efraim Freitas da Silva',
-  'Emerson Eduardo da Silva Barbosa','Emilyanna Monachele da Silva Aníbal',
-  'João Pedro Lopes de Lima','José Adeilton Cordeiro de Souza','José Luís da Costa Oliveira',
-  'Juliana Raysa Silva dos Santos','Leonor Fernanda Cantuária Gusmão','Lucas José do Nascimento',
-  'Mariana Cavalcanti Pereira','Marcos Amaro Almeida','Patrícia Mariana Vasco de Goz',
-  'Rauã Bezerra da Silva','Samanta Gabriela de Lima','Thiago Roberto Vieira Gomes',
-  'Virgínia Estela Silva de Albuquerque','Wellington Borges da Silva Filho'
-];
-
-// ── LOGIN ──
-app.post('/api/login', (req, res) => {
-  const { senha } = req.body;
-  res.json({ ok: senha === COORD_SENHA });
-});
-
-// ── ENVIAR QUESTÕES ──
-app.post('/api/enviar', upload.single('arquivo'), async (req, res) => {
-  try {
-    const { professor, materia, simulado, ano } = req.body;
-    if (!professor || !materia || !simulado) return res.status(400).json({ erro: 'Preencha todos os campos.' });
-    if (!PROFESSORES.includes(professor)) return res.status(400).json({ erro: 'Professor não encontrado.' });
-    const arquivo = req.file;
-    if (!arquivo) return res.status(400).json({ erro: 'Nenhum arquivo enviado.' });
-
-    const nomeArquivo = `${ano||'2025'}/${simulado}/${professor.replace(/\s+/g,'_')}.docx`;
-
-    const { error: uploadError } = await supabase.storage
-      .from('questoes')
-      .upload(nomeArquivo, arquivo.buffer, { contentType: arquivo.mimetype, upsert: true });
-    if (uploadError) throw uploadError;
-
-    const { error: dbError } = await supabase
-      .from('envios')
-      .upsert({ professor, materia, simulado, ano: ano||'2025', arquivo: nomeArquivo, enviado_em: new Date().toISOString() },
-        { onConflict: 'professor,simulado,ano' });
-    if (dbError) throw dbError;
-
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: 'Erro ao salvar. Tente novamente.' });
-  }
-});
-
-// ── LISTAR ENVIOS ──
-app.get('/api/envios', async (req, res) => {
-  try {
-    const { simulado, ano } = req.query;
-    let query = supabase.from('envios').select('*').order('enviado_em', { ascending: false });
-    if (simulado) query = query.eq('simulado', simulado);
-    if (ano) query = query.eq('ano', ano);
-    const { data, error } = await query;
-    if (error) throw error;
-
-    const lista = PROFESSORES.map(nome => {
-      const envio = data.find(e => e.professor === nome);
-      return {
-        professor: nome,
-        status: envio ? 'enviou' : 'pendente',
-        materia: envio?.materia || null,
-        simulado: envio?.simulado || null,
-        enviado_em: envio?.enviado_em || null,
-        arquivo: envio?.arquivo || null
-      };
-    });
-
-    res.json({ ok: true, lista });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: 'Erro ao buscar envios.' });
-  }
-});
-
-// ── BAIXAR ARQUIVO INDIVIDUAL ──
-app.get('/api/arquivo/:professor', async (req, res) => {
-  try {
-    const { simulado, ano } = req.query;
-    const { data, error } = await supabase.from('envios').select('arquivo,professor')
-      .eq('professor', decodeURIComponent(req.params.professor))
-      .eq('simulado', simulado).eq('ano', ano).single();
-    if (error || !data) return res.status(404).json({ erro: 'Arquivo não encontrado.' });
-
-    const { data: fileData, error: dlError } = await supabase.storage.from('questoes').download(data.arquivo);
-    if (dlError) throw dlError;
-
-    const buffer = Buffer.from(await fileData.arrayBuffer());
-    const nomeDownload = `${data.professor.replace(/\s+/g,'_')}_${simulado}.docx`;
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="${nomeDownload}"`);
-    res.send(buffer);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: 'Erro ao baixar arquivo.' });
-  }
-});
-
-// ── BAIXAR TUDO JUNTO (mescla os docx) ──
-app.get('/api/baixar-tudo', async (req, res) => {
-  try {
-    const { simulado, ano } = req.query;
-
-    // Buscar todos os envios do simulado
-    const { data, error } = await supabase.from('envios').select('*')
-      .eq('simulado', simulado).eq('ano', ano||'2025').order('materia');
-    if (error) throw error;
-    if (!data || data.length === 0) return res.status(404).json({ erro: 'Nenhum arquivo encontrado para este simulado.' });
-
-    // Baixar todos os buffers
-    const buffers = [];
-    for (const envio of data) {
-      const { data: fileData, error: dlError } = await supabase.storage.from('questoes').download(envio.arquivo);
-      if (!dlError && fileData) {
-        const buf = Buffer.from(await fileData.arrayBuffer());
-        buffers.push(buf);
-      }
-    }
-
-    if (buffers.length === 0) return res.status(404).json({ erro: 'Nenhum arquivo encontrado.' });
-
-    // Se só tem um arquivo, baixa direto
-    if (buffers.length === 1) {
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-      res.setHeader('Content-Disposition', `attachment; filename="prova_${simulado}_${ano}.docx"`);
-      return res.send(buffers[0]);
-    }
-
-    // Mescla os docx usando python-docx via script python
-    const { execSync } = require('child_process');
-    const fs = require('fs');
-    const os = require('os');
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'provas-'));
-
-    // Salvar arquivos temporários
-    const arquivosPaths = buffers.map((buf, i) => {
-      const p = path.join(tmpDir, `doc_${i}.docx`);
-      fs.writeFileSync(p, buf);
-      return p;
-    });
-
-    const outputPath = path.join(tmpDir, 'prova_final.docx');
-
-    // Script Python para mesclar
-    const script = `
+"""
+Formatador de questões — EREM Monsenhor João Rodrigues de Carvalho
+Lê um arquivo .docx do professor e retorna um .docx formatado no padrão da escola.
+"""
+import re
 import sys
+import copy
 from docx import Document
+from docx.shared import Pt, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-import copy
 
-def add_page_break(doc):
-    p = OxmlElement('w:p')
-    r = OxmlElement('w:r')
-    br = OxmlElement('w:br')
-    br.set(qn('w:type'), 'page')
-    r.append(br)
-    p.append(r)
-    doc.element.body.append(p)
 
-files = ${JSON.stringify(arquivosPaths)}
-output = "${outputPath}"
+# ── LETRAS DE ALTERNATIVAS ──
+LETRAS = ['a', 'b', 'c', 'd', 'e']
 
-base = Document(files[0])
+# Padrões para detectar início de questão
+RE_QUESTAO = re.compile(
+    r'^(\*{0,2})\s*(\d{1,2})\s*[-–\.)\]°º]',
+    re.IGNORECASE
+)
 
-for i, f in enumerate(files[1:]):
-    add_page_break(base)
-    doc = Document(f)
-    for element in doc.element.body:
-        base.element.body.append(copy.deepcopy(element))
+# Padrões para detectar alternativa
+RE_ALT = re.compile(
+    r'^\s*[-–]?\s*([aAbBcCdDeE])\s*[-–\)\.]\s*(.+)',
+    re.DOTALL
+)
 
-base.save(output)
-print("ok")
-`;
+# Padrões alternativos sem letra (só travessão)
+RE_ALT_SEM_LETRA = re.compile(r'^\s*[-–•]\s*(.+)')
 
-    const scriptPath = path.join(tmpDir, 'merge.py');
-    fs.writeFileSync(scriptPath, script);
+# Cabeçalho a ignorar (linhas que identificam o documento, não questões)
+RE_CABECALHO = re.compile(
+    r'(erem|monsenhor|prof\.|série|ano\s*[–-]|avalia[çc]|trimestre|simulado|gabarito)',
+    re.IGNORECASE
+)
 
-    try {
-      execSync(`python3 -m pip install python-docx --quiet && python3 "${scriptPath}"`, { timeout: 60000 });
-      const finalBuffer = fs.readFileSync(outputPath);
+# Referência de questão ex: (ENEM 2022), (SSA 2025)
+RE_REF = re.compile(r'\((ENEM|SSA|SAEPE|ENADE)[\s\d\.]*\d{4}[\s\d\.]*\)', re.IGNORECASE)
 
-      // Limpar temp
-      fs.rmSync(tmpDir, { recursive: true, force: true });
 
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-      res.setHeader('Content-Disposition', `attachment; filename="prova_${simulado}_${ano}.docx"`);
-      return res.send(finalBuffer);
-    } catch (pyErr) {
-      // Se python falhar, retorna o primeiro arquivo com aviso
-      console.error('Python merge failed:', pyErr.message);
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-      // Fallback: retorna o primeiro
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-      res.setHeader('Content-Disposition', `attachment; filename="prova_${simulado}_${ano}.docx"`);
-      return res.send(buffers[0]);
-    }
+def limpar_texto(txt):
+    """Remove asteriscos de markdown e espaços extras."""
+    txt = re.sub(r'\*+', '', txt)
+    return txt.strip()
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ erro: 'Erro ao gerar arquivo.' });
-  }
-});
 
-// ── ROTA PADRÃO ──
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+def is_cabecalho(txt):
+    """Verifica se o parágrafo é cabeçalho/título do professor."""
+    t = limpar_texto(txt)
+    if len(t) < 3:
+        return True
+    if RE_CABECALHO.search(t) and len(t) < 120:
+        # Só ignora se for curto (título) e não tiver alternativas
+        if not RE_ALT.match(t):
+            return True
+    return False
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Servidor rodando em http://localhost:${PORT}`));
+
+def extrair_paragrafos(doc):
+    """Extrai todos os parágrafos incluindo os dentro de tabelas."""
+    items = []
+    for block in doc.element.body:
+        tag = block.tag.split('}')[-1]
+        if tag == 'p':
+            items.append(('p', block))
+        elif tag == 'tbl':
+            # Extrair texto de tabelas como parágrafo especial
+            from docx.table import Table
+            tbl = Table(block, doc)
+            textos = []
+            for row in tbl.rows:
+                for cell in row.cells:
+                    for p in cell.paragraphs:
+                        t = p.text.strip()
+                        if t:
+                            textos.append(t)
+            if textos:
+                items.append(('tabela', ' | '.join(textos)))
+    return items
+
+
+class Questao:
+    def __init__(self):
+        self.numero = None
+        self.referencia = ''
+        self.enunciado_parts = []  # lista de (tipo, conteudo) onde tipo = 'texto' ou 'img'
+        self.alternativas = []  # lista de (letra, texto)
+        self.texto_apoio = []  # textos antes do enunciado principal
+        self._alt_sem_letra_count = 0
+
+    def adicionar_alternativa_sem_letra(self, texto):
+        if self._alt_sem_letra_count < 5:
+            letra = LETRAS[self._alt_sem_letra_count]
+            self.alternativas.append((letra, texto))
+            self._alt_sem_letra_count += 1
+
+    def completa(self):
+        return self.numero is not None and len(self.enunciado_parts) > 0
+
+
+def parsear_questoes(doc):
+    """Parseia o documento e retorna lista de Questao."""
+    questoes = []
+    questao_atual = None
+    modo = 'inicio'  # inicio, enunciado, alternativas
+    alt_sem_letra_buffer = []
+
+    for para in doc.paragraphs:
+        txt_raw = para.text.strip()
+        txt = limpar_texto(txt_raw)
+
+        if not txt:
+            continue
+
+        # Verificar se é início de nova questão
+        m_q = RE_QUESTAO.match(txt_raw.strip())
+        if m_q:
+            # Salvar questão anterior
+            if questao_atual and questao_atual.completa():
+                # Processar alternativas sem letra se houver
+                if alt_sem_letra_buffer and not questao_atual.alternativas:
+                    for t in alt_sem_letra_buffer:
+                        questao_atual.adicionar_alternativa_sem_letra(t)
+                questoes.append(questao_atual)
+
+            alt_sem_letra_buffer = []
+            questao_atual = Questao()
+            questao_atual.numero = int(m_q.group(2))
+            modo = 'enunciado'
+
+            # Extrair referência se houver
+            ref_m = RE_REF.search(txt)
+            if ref_m:
+                questao_atual.referencia = ref_m.group(0)
+
+            # Texto após o número — remove referência duplicada
+            resto = txt_raw.strip()[m_q.end():].strip()
+            resto = limpar_texto(resto)
+            # Remove referência se já foi capturada
+            if questao_atual.referencia:
+                resto = resto.replace(questao_atual.referencia, '').strip()
+            if resto:
+                questao_atual.enunciado_parts.append(('texto', resto))
+            continue
+
+        if questao_atual is None:
+            # Antes da primeira questão — ignorar cabeçalho
+            continue
+
+        # Verificar se é alternativa com letra
+        m_alt = RE_ALT.match(txt)
+        if m_alt:
+            letra = m_alt.group(1).lower()
+            conteudo = limpar_texto(m_alt.group(2))
+            questao_atual.alternativas.append((letra, conteudo))
+            modo = 'alternativas'
+            continue
+
+        # Verificar se é alternativa sem letra (travessão)
+        m_alt2 = RE_ALT_SEM_LETRA.match(txt)
+        if m_alt2 and modo == 'alternativas' or (m_alt2 and len(alt_sem_letra_buffer) > 0):
+            alt_sem_letra_buffer.append(limpar_texto(m_alt2.group(1)))
+            continue
+
+        # Verificar se parece alternativa sem letra no modo enunciado
+        if modo == 'enunciado' and RE_ALT_SEM_LETRA.match(txt):
+            alt_sem_letra_buffer.append(limpar_texto(RE_ALT_SEM_LETRA.match(txt).group(1)))
+            if len(alt_sem_letra_buffer) >= 2:
+                modo = 'alternativas'
+            continue
+
+        # Cabeçalho a ignorar
+        if is_cabecalho(txt) and questao_atual.numero is None:
+            continue
+
+        # Texto normal — vai para enunciado ou texto de apoio
+        if modo == 'enunciado' or modo == 'inicio':
+            questao_atual.enunciado_parts.append(('texto', txt))
+
+    # Última questão
+    if questao_atual and questao_atual.completa():
+        if alt_sem_letra_buffer and not questao_atual.alternativas:
+            for t in alt_sem_letra_buffer:
+                questao_atual.adicionar_alternativa_sem_letra(t)
+        questoes.append(questao_atual)
+
+    return questoes
+
+
+def set_paragraph_spacing(para, before=0, after=6):
+    pPr = para._p.get_or_add_pPr()
+    pSpacing = OxmlElement('w:spacing')
+    pSpacing.set(qn('w:before'), str(before))
+    pSpacing.set(qn('w:after'), str(after))
+    pPr.append(pSpacing)
+
+
+def adicionar_run_bold(para, texto, tamanho=11):
+    run = para.add_run(texto)
+    run.bold = True
+    run.font.size = Pt(tamanho)
+    run.font.name = 'Arial'
+    return run
+
+
+def adicionar_run_normal(para, texto, tamanho=11):
+    run = para.add_run(texto)
+    run.bold = False
+    run.font.size = Pt(tamanho)
+    run.font.name = 'Arial'
+    return run
+
+
+def gerar_documento_formatado(questoes, simulado='', ano='2025'):
+    """Gera um novo documento Word formatado no padrão da escola."""
+    doc = Document()
+
+    # Configurar margens e duas colunas
+    from docx.shared import Cm
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+    for section in doc.sections:
+        section.top_margin = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin = Cm(2)
+        section.right_margin = Cm(2)
+        # Duas colunas
+        sectPr = section._sectPr
+        # Remover cols existente se houver
+        for old_cols in sectPr.findall(qn('w:cols')):
+            sectPr.remove(old_cols)
+        cols = OxmlElement('w:cols')
+        cols.set(qn('w:num'), '2')
+        cols.set(qn('w:space'), '720')
+        cols.set(qn('w:equalWidth'), '1')
+        sectPr.append(cols)
+
+    for i, q in enumerate(questoes):
+        # ── ENUNCIADO ──
+        para_enunc = doc.add_paragraph()
+        set_paragraph_spacing(para_enunc, before=120 if i > 0 else 0, after=60)
+
+        # Número da questão
+        num_texto = f"{str(q.numero).zfill(2)}. "
+        if q.referencia:
+            num_texto += f"{q.referencia} "
+
+        run_num = para_enunc.add_run(num_texto)
+        run_num.bold = True
+        run_num.font.size = Pt(11)
+        run_num.font.name = 'Arial'
+
+        # Texto do enunciado
+        for tipo, conteudo in q.enunciado_parts:
+            if tipo == 'texto':
+                run = para_enunc.add_run(conteudo)
+                run.bold = True
+                run.font.size = Pt(11)
+                run.font.name = 'Arial'
+
+        # ── ALTERNATIVAS ──
+        if q.alternativas:
+            for letra, texto in q.alternativas:
+                para_alt = doc.add_paragraph()
+                set_paragraph_spacing(para_alt, before=20, after=20)
+                para_alt.paragraph_format.left_indent = Pt(18)
+
+                run_letra = para_alt.add_run(f"{letra}) ")
+                run_letra.bold = False
+                run_letra.font.size = Pt(11)
+                run_letra.font.name = 'Arial'
+
+                run_txt = para_alt.add_run(texto)
+                run_txt.bold = False
+                run_txt.font.size = Pt(11)
+                run_txt.font.name = 'Arial'
+        else:
+            # Sem alternativas identificadas — adicionar espaço
+            para_vazio = doc.add_paragraph()
+            run = para_vazio.add_run("[Alternativas não identificadas automaticamente — revisar]")
+            run.font.color.rgb = RGBColor(0xFF, 0x00, 0x00)
+            run.font.size = Pt(10)
+            run.italic = True
+
+    return doc
+
+
+def formatar_arquivo(input_path, output_path, simulado='', ano='2025'):
+    """Função principal: lê o docx do professor e salva formatado."""
+    doc_entrada = Document(input_path)
+    questoes = parsear_questoes(doc_entrada)
+
+    if not questoes:
+        # Se não encontrou questões, apenas copia o documento
+        doc_entrada.save(output_path)
+        return 0
+
+    doc_saida = gerar_documento_formatado(questoes, simulado, ano)
+    doc_saida.save(output_path)
+    return len(questoes)
+
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print("Uso: python formatar.py entrada.docx saida.docx [simulado] [ano]")
+        sys.exit(1)
+
+    entrada = sys.argv[1]
+    saida = sys.argv[2]
+    simulado = sys.argv[3] if len(sys.argv) > 3 else ''
+    ano = sys.argv[4] if len(sys.argv) > 4 else '2025'
+
+    n = formatar_arquivo(entrada, saida, simulado, ano)
+    print(f"ok:{n}")
